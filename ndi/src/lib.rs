@@ -1,6 +1,7 @@
 //! Safe, minimal wrappers around the NDI SDK.
 //!
-//! The SDK is not vendored: `libndi.so.6` is loaded at runtime with `dlopen`, so
+//! The SDK is not vendored: the runtime (`libndi.so.6`, `libndi.dylib` or
+//! `Processing.NDI.Lib.x64.dll`) is loaded at run time, so
 //! building needs no SDK headers and the NDI runtime from the official SDK
 //! installer (or `NDI_RUNTIME_DIR_V6`) is picked up at run time.
 //!
@@ -14,7 +15,8 @@ pub mod sys;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::ptr;
-use std::sync::{Arc, OnceLock};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use sys::{
     FOURCC_BGRA, FOURCC_BGRX, FOURCC_I420, FOURCC_NV12, FOURCC_RGBA, FOURCC_RGBX, FOURCC_UYVA,
@@ -38,58 +40,107 @@ struct Runtime {
     _lib: libloading::Library,
 }
 
-static RUNTIME: OnceLock<std::result::Result<Runtime, String>> = OnceLock::new();
+/// Set once the runtime has loaded. A failed load is not cached, so a runtime
+/// installed while the process is running is picked up by the next attempt.
+static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+/// Serialises load attempts.
+static LOADING: Mutex<()> = Mutex::new(());
 
-fn candidates() -> Vec<String> {
+/// File name of the NDI runtime library on this platform.
+pub const LIBRARY_NAME: &str = if cfg!(windows) {
+    "Processing.NDI.Lib.x64.dll"
+} else if cfg!(target_os = "macos") {
+    "libndi.dylib"
+} else {
+    "libndi.so.6"
+};
+
+/// Places the runtime is looked for, in order: the directories named by the
+/// runtime installer's environment variables, then the usual install locations.
+pub fn default_search_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
     for var in ["NDI_RUNTIME_DIR_V6", "NDI_RUNTIME_DIR_V5"] {
-        if let Ok(dir) = std::env::var(var) {
-            v.push(format!("{}/libndi.so.6", dir.trim_end_matches('/')));
-            v.push(format!("{}/libndi.so", dir.trim_end_matches('/')));
+        if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
+            let dir = PathBuf::from(dir);
+            v.push(dir.join(LIBRARY_NAME));
+            if cfg!(all(unix, not(target_os = "macos"))) {
+                v.push(dir.join("libndi.so"));
+            }
         }
     }
-    v.push("libndi.so.6".into());
-    v.push("libndi.so".into());
-    v.push("/usr/local/lib/libndi.so.6".into());
-    v.push("/usr/lib/libndi.so.6".into());
+    if cfg!(windows) {
+        // Found through the DLL search path (the runtime installer adds its directory to PATH).
+        v.push(LIBRARY_NAME.into());
+    } else if cfg!(target_os = "macos") {
+        v.push("/usr/local/lib/libndi.dylib".into());
+        v.push("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib".into());
+    } else {
+        v.push("libndi.so.6".into());
+        v.push("libndi.so".into());
+        v.push("/usr/local/lib/libndi.so.6".into());
+        v.push("/usr/lib/libndi.so.6".into());
+    }
     v
 }
 
-fn load_runtime() -> std::result::Result<Runtime, String> {
+fn load_runtime(paths: &[PathBuf]) -> std::result::Result<Runtime, String> {
     let mut errors = Vec::new();
-    for path in candidates() {
+    for path in paths {
+        // A missing absolute path is not worth an error line per attempt.
+        if path.is_absolute() && !path.exists() {
+            continue;
+        }
         // SAFETY: loading the NDI runtime runs its (trusted) initialisers.
-        match unsafe { libloading::Library::new(&path) } {
+        match unsafe { libloading::Library::new(path) } {
             Ok(lib) => {
                 // SAFETY: the symbols are declared with the SDK's C signatures.
                 let api = unsafe { sys::Api::load(&lib) }
-                    .map_err(|e| format!("{path}: missing NDI symbol: {e}"))?;
+                    .map_err(|e| format!("{}: missing NDI symbol: {e}", path.display()))?;
                 // SAFETY: plain C call.
                 if !unsafe { (api.initialize)() } {
                     return Err("NDIlib_initialize failed (unsupported CPU?)".into());
                 }
                 return Ok(Runtime { api, _lib: lib });
             }
-            Err(e) => errors.push(format!("{path}: {e}")),
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
         }
     }
     Err(format!(
-        "NDI runtime (libndi.so.6) not found. Install the NDI SDK or set NDI_RUNTIME_DIR_V6.\n  {}",
+        "NDI runtime ({LIBRARY_NAME}) not found. Install the NDI runtime or set NDI_RUNTIME_DIR_V6.\n  {}",
         errors.join("\n  ")
     ))
 }
 
-fn api() -> Result<&'static sys::Api> {
-    match RUNTIME.get_or_init(load_runtime) {
-        Ok(rt) => Ok(&rt.api),
-        Err(e) => Err(Error(e.clone())),
+fn load(extra: &[PathBuf]) -> Result<&'static sys::Api> {
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(&rt.api);
     }
+    let _guard = LOADING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(&rt.api);
+    }
+    let paths: Vec<PathBuf> = extra.iter().cloned().chain(default_search_paths()).collect();
+    let rt = load_runtime(&paths).map_err(Error)?;
+    Ok(&RUNTIME.get_or_init(|| rt).api)
+}
+
+fn api() -> Result<&'static sys::Api> {
+    load(&[])
 }
 
 /// Load and initialise the NDI runtime. Called implicitly by every constructor;
 /// call it early to fail fast with a helpful message.
+///
+/// A failed attempt is retried by the next call.
 pub fn init() -> Result<()> {
     api().map(|_| ())
+}
+
+/// Like [`init`], but try `paths` (library files, or bare names for the
+/// platform's library search) before [`default_search_paths`]. Has no effect
+/// once the runtime is loaded.
+pub fn init_with_paths(paths: &[PathBuf]) -> Result<()> {
+    load(paths).map(|_| ())
 }
 
 /// Version string of the loaded NDI runtime.

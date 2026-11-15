@@ -3,7 +3,7 @@ name = "ndi"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Minimal runtime-loaded bindings to the NDI SDK (libndi.so.6)"
+description = "Minimal runtime-loaded bindings to the NDI SDK (Linux, macOS, Windows)"
 
 [dependencies]
-libloading = "0.8"
+libloading = "0.9"
