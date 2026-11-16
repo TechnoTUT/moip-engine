@@ -11,7 +11,7 @@ It was written for [moip-toolkit](https://github.com/TechnoTUT/moip-toolkit) and
 
 ```
 ├── ndi/                # NDI SDK bindings, loaded at run time (library crate)
-└── moip-engine/src/    # moip-engine binary
+└── src/                # moip-engine binary
     ├── rx.rs           # fullscreen viewer
     ├── recv.rs         # capture thread, stall recovery, audio meter
     ├── gfx.rs          # SDL2/OpenGL window, UYVY shader, labels
