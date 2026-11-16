@@ -287,6 +287,20 @@ impl Source {
     }
 }
 
+/// Looks `query` up in `sources`: a source whose full name equals it, then one
+/// whose stream name equals it, then one whose full name contains it (so
+/// `"OBS"` finds `"PC (OBS Main)"`). Returns the first match in list order.
+pub fn find_source<'a>(sources: &'a [Source], query: &str) -> Option<&'a Source> {
+    if query.is_empty() {
+        return None;
+    }
+    sources
+        .iter()
+        .find(|s| s.name == query)
+        .or_else(|| sources.iter().find(|s| s.stream_name() == query))
+        .or_else(|| sources.iter().find(|s| s.name.contains(query)))
+}
+
 fn split_name(name: &str) -> (&str, &str) {
     match (name.find(" ("), name.ends_with(')')) {
         (Some(i), true) => (&name[..i], &name[i + 2..name.len() - 1]),
@@ -805,6 +819,20 @@ mod tests {
         assert!(s.matches("STUDIO-PC (OBS Main)"));
         let plain = Source::new("weird");
         assert_eq!(plain.stream_name(), "weird");
+    }
+
+    #[test]
+    fn find_source_prefers_exact_then_stream_then_substring() {
+        let list = vec![
+            Source::new("A (OBS Main)"),
+            Source::new("B (OBS)"),
+            Source::new("OBS (Cam)"),
+        ];
+        assert_eq!(find_source(&list, "OBS (Cam)").unwrap().name, "OBS (Cam)");
+        assert_eq!(find_source(&list, "OBS").unwrap().name, "B (OBS)");
+        assert_eq!(find_source(&list, "Main").unwrap().name, "A (OBS Main)");
+        assert!(find_source(&list, "nothing").is_none());
+        assert!(find_source(&list, "").is_none());
     }
 
     #[test]
