@@ -482,6 +482,16 @@ pub enum Capture {
     Error,
 }
 
+/// Result of [`Receiver::capture_newest_video`].
+pub enum NewestVideo {
+    /// No video frame within the timeout.
+    None,
+    /// The newest frame, and how many older queued frames were skipped.
+    Frame(VideoFrame, usize),
+    /// The SDK reported a connection error.
+    Error,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Performance {
     pub video_total: i64,
@@ -558,6 +568,24 @@ impl Receiver {
             sys::FRAME_TYPE_ERROR => Capture::Error,
             _ => Capture::None,
         }
+    }
+
+    /// Waits up to `timeout_ms` for a video frame and returns the newest one:
+    /// frames that queued up behind it are released at once, so a consumer
+    /// that falls behind catches up instead of drifting into latency. Only
+    /// video is requested. The `usize` is how many older frames were skipped.
+    pub fn capture_newest_video(&self, timeout_ms: u32) -> NewestVideo {
+        let mut frame = match self.capture(timeout_ms, true, false) {
+            Capture::Video(f) => f,
+            Capture::Error => return NewestVideo::Error,
+            _ => return NewestVideo::None,
+        };
+        let mut skipped = 0;
+        while let Capture::Video(next) = self.capture(0, true, false) {
+            frame = next;
+            skipped += 1;
+        }
+        NewestVideo::Frame(frame, skipped)
     }
 
     /// Number of senders this receiver is connected to (0 or 1).
