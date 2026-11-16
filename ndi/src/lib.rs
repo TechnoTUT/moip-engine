@@ -287,6 +287,20 @@ impl Source {
     }
 }
 
+/// Looks `query` up in `sources`: a source whose full name equals it, then one
+/// whose stream name equals it, then one whose full name contains it (so
+/// `"OBS"` finds `"PC (OBS Main)"`). Returns the first match in list order.
+pub fn find_source<'a>(sources: &'a [Source], query: &str) -> Option<&'a Source> {
+    if query.is_empty() {
+        return None;
+    }
+    sources
+        .iter()
+        .find(|s| s.name == query)
+        .or_else(|| sources.iter().find(|s| s.stream_name() == query))
+        .or_else(|| sources.iter().find(|s| s.name.contains(query)))
+}
+
 fn split_name(name: &str) -> (&str, &str) {
     match (name.find(" ("), name.ends_with(')')) {
         (Some(i), true) => (&name[..i], &name[i + 2..name.len() - 1]),
@@ -468,6 +482,16 @@ pub enum Capture {
     Error,
 }
 
+/// Result of [`Receiver::capture_newest_video`].
+pub enum NewestVideo {
+    /// No video frame within the timeout.
+    None,
+    /// The newest frame, and how many older queued frames were skipped.
+    Frame(VideoFrame, usize),
+    /// The SDK reported a connection error.
+    Error,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Performance {
     pub video_total: i64,
@@ -544,6 +568,24 @@ impl Receiver {
             sys::FRAME_TYPE_ERROR => Capture::Error,
             _ => Capture::None,
         }
+    }
+
+    /// Waits up to `timeout_ms` for a video frame and returns the newest one:
+    /// frames that queued up behind it are released at once, so a consumer
+    /// that falls behind catches up instead of drifting into latency. Only
+    /// video is requested. The `usize` is how many older frames were skipped.
+    pub fn capture_newest_video(&self, timeout_ms: u32) -> NewestVideo {
+        let mut frame = match self.capture(timeout_ms, true, false) {
+            Capture::Video(f) => f,
+            Capture::Error => return NewestVideo::Error,
+            _ => return NewestVideo::None,
+        };
+        let mut skipped = 0;
+        while let Capture::Video(next) = self.capture(0, true, false) {
+            frame = next;
+            skipped += 1;
+        }
+        NewestVideo::Frame(frame, skipped)
     }
 
     /// Number of senders this receiver is connected to (0 or 1).
@@ -805,6 +847,20 @@ mod tests {
         assert!(s.matches("STUDIO-PC (OBS Main)"));
         let plain = Source::new("weird");
         assert_eq!(plain.stream_name(), "weird");
+    }
+
+    #[test]
+    fn find_source_prefers_exact_then_stream_then_substring() {
+        let list = vec![
+            Source::new("A (OBS Main)"),
+            Source::new("B (OBS)"),
+            Source::new("OBS (Cam)"),
+        ];
+        assert_eq!(find_source(&list, "OBS (Cam)").unwrap().name, "OBS (Cam)");
+        assert_eq!(find_source(&list, "OBS").unwrap().name, "B (OBS)");
+        assert_eq!(find_source(&list, "Main").unwrap().name, "A (OBS Main)");
+        assert!(find_source(&list, "nothing").is_none());
+        assert!(find_source(&list, "").is_none());
     }
 
     #[test]

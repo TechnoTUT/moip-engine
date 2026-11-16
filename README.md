@@ -146,6 +146,8 @@ fn main() -> ndi::Result<()> {
 }
 ```
 
+For low-latency video-only receivers, `Receiver::capture_newest_video` returns the newest frame and releases older queued ones at once. `ndi::find_source` looks a source up by full name, stream name or part of the name.
+
 The crate also has `Sender` for publishing video and audio. No SDK headers are needed at build time, and no NDI code is linked into your binary. [`ndi/examples/churn.rs`](ndi/examples/churn.rs) is a fuller example.
 
 ## Environment variables
