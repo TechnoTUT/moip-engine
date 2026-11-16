@@ -24,12 +24,46 @@ pub use sys::{
     FOURCC_UYVY,
 };
 
+/// What kind of failure an [`Error`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ErrorKind {
+    /// No NDI runtime library could be opened at any searched path.
+    RuntimeNotFound,
+    /// A library was opened but lacks a required NDI function (wrong or too old a library).
+    RuntimeMissingSymbol,
+    /// The library loaded but `NDIlib_initialize` failed (for example, an unsupported CPU).
+    RuntimeInitFailed,
+    /// Anything else, such as the SDK refusing to create a finder, receiver or sender.
+    Other,
+}
+
 #[derive(Debug, Clone)]
-pub struct Error(String);
+pub struct Error {
+    kind: ErrorKind,
+    message: String,
+    detail: Option<String>,
+}
+
+impl Error {
+    fn new(kind: ErrorKind, message: impl Into<String>) -> Error {
+        Error { kind, message: message.into(), detail: None }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    /// For [`ErrorKind::RuntimeMissingSymbol`] and [`ErrorKind::RuntimeInitFailed`]:
+    /// the library path and the reason it could not be used, on one line.
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 impl std::error::Error for Error {}
@@ -140,6 +174,9 @@ unsafe fn open_library(path: &Path) -> std::result::Result<libloading::Library, 
 
 fn load_runtime(paths: &[PathBuf]) -> Result<Runtime> {
     let mut errors = Vec::new();
+    // The first library that was found but unusable decides the kind; a
+    // broken install is more useful to report than the paths that were empty.
+    let mut unusable: Option<(ErrorKind, String)> = None;
     for path in paths {
         if path.is_absolute() && !path.exists() {
             errors.push(format!("{}: not found", path.display()));
@@ -157,21 +194,33 @@ fn load_runtime(paths: &[PathBuf]) -> Result<Runtime> {
         let api = match unsafe { sys::Api::load(&lib) } {
             Ok(api) => api,
             Err(e) => {
-                errors.push(format!("{}: missing NDI symbol: {e}", path.display()));
+                let line = format!("{}: missing NDI symbol: {e}", path.display());
+                unusable.get_or_insert((ErrorKind::RuntimeMissingSymbol, line.clone()));
+                errors.push(line);
                 continue;
             }
         };
         // SAFETY: plain C call.
         if !unsafe { (api.initialize)() } {
-            errors.push(format!("{}: NDIlib_initialize failed (unsupported CPU?)", path.display()));
+            let line = format!("{}: NDIlib_initialize failed (unsupported CPU?)", path.display());
+            unusable.get_or_insert((ErrorKind::RuntimeInitFailed, line.clone()));
+            errors.push(line);
             continue;
         }
         return Ok(Runtime { api, _lib: lib });
     }
-    Err(Error(format!(
-        "NDI runtime ({LIBRARY_NAME}) could not be loaded. Install the NDI runtime or set NDI_RUNTIME_DIR_V6.\n  {}",
-        errors.join("\n  ")
-    )))
+    let (kind, detail) = match unusable {
+        Some((kind, line)) => (kind, Some(line)),
+        None => (ErrorKind::RuntimeNotFound, None),
+    };
+    Err(Error {
+        kind,
+        message: format!(
+            "NDI runtime ({LIBRARY_NAME}) could not be loaded. Install the NDI runtime or set NDI_RUNTIME_DIR_V6.\n  {}",
+            errors.join("\n  ")
+        ),
+        detail,
+    })
 }
 
 /// `extra`: `Some` replaces the remembered [`init_with_paths`] paths.
@@ -346,7 +395,7 @@ impl Finder {
         // SAFETY: cfg and its strings outlive the call.
         let ptr = unsafe { (api.find_create_v2)(&cfg) };
         if ptr.is_null() {
-            return Err(Error("NDIlib_find_create_v2 failed".into()));
+            return Err(Error::new(ErrorKind::Other, "NDIlib_find_create_v2 failed"));
         }
         Ok(Self { api, ptr })
     }
@@ -518,7 +567,7 @@ impl Receiver {
         // SAFETY: cfg and its strings outlive the call.
         let ptr = unsafe { (api.recv_create_v3)(&cfg) };
         if ptr.is_null() {
-            return Err(Error("NDIlib_recv_create_v3 failed".into()));
+            return Err(Error::new(ErrorKind::Other, "NDIlib_recv_create_v3 failed"));
         }
         Ok(Self { inner: Arc::new(RecvInner { api, ptr }) })
     }
@@ -712,17 +761,27 @@ impl AudioFrame {
     pub fn samples(&self) -> usize {
         self.raw.no_samples.max(0) as usize
     }
-    /// Samples of channel `ch` (FLTP layout).
+    /// Samples of channel `ch` (FLTP layout). Empty if the frame is not FLTP,
+    /// has no data, or reports planes too close together to hold `samples` floats.
     pub fn channel(&self, ch: usize) -> &[f32] {
         if self.raw.p_data.is_null() || ch >= self.channels() || self.raw.fourcc != sys::FOURCC_FLTP {
             return &[];
         }
         let stride = self.raw.channel_stride_in_bytes.max(0) as usize;
-        // SAFETY: FLTP data holds `channels` planes of `samples` floats, `stride` bytes apart.
+        if !plane_fits(stride, self.samples()) {
+            return &[];
+        }
+        // SAFETY: FLTP data holds `channels` planes of `samples` floats, `stride` bytes apart,
+        // and `stride` was checked to be at least one plane long.
         unsafe {
             std::slice::from_raw_parts(self.raw.p_data.add(ch * stride) as *const f32, self.samples())
         }
     }
+}
+
+/// Whether planes `stride` bytes apart can each hold `samples` f32 values.
+fn plane_fits(stride: usize, samples: usize) -> bool {
+    samples.checked_mul(std::mem::size_of::<f32>()).is_some_and(|need| stride >= need)
 }
 
 impl Drop for AudioFrame {
@@ -773,7 +832,7 @@ impl Sender {
         // SAFETY: cfg and its strings outlive the call.
         let ptr = unsafe { (api.send_create)(&cfg) };
         if ptr.is_null() {
-            return Err(Error(format!("NDIlib_send_create failed for \"{name}\"")));
+            return Err(Error::new(ErrorKind::Other, format!("NDIlib_send_create failed for \"{name}\"")));
         }
         Ok(Self { api, ptr })
     }
@@ -861,6 +920,32 @@ mod tests {
         assert_eq!(find_source(&list, "Main").unwrap().name, "A (OBS Main)");
         assert!(find_source(&list, "nothing").is_none());
         assert!(find_source(&list, "").is_none());
+    }
+
+    #[test]
+    fn audio_plane_must_hold_all_samples() {
+        assert!(plane_fits(4096, 1024));
+        assert!(plane_fits(8192, 1024));
+        assert!(!plane_fits(4095, 1024));
+        assert!(!plane_fits(0, 1));
+        assert!(plane_fits(0, 0));
+        assert!(!plane_fits(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn load_error_kinds() {
+        let missing = load_runtime(&[PathBuf::from("/nonexistent/libndi-test.so")]).err().unwrap();
+        assert_eq!(missing.kind(), ErrorKind::RuntimeNotFound);
+        assert!(missing.detail().is_none());
+        // A real library that is not NDI: found, but the NDI functions are missing.
+        #[cfg(target_os = "linux")]
+        {
+            let paths = [PathBuf::from("/nonexistent/libndi-test.so"), PathBuf::from("libc.so.6")];
+            let wrong = load_runtime(&paths).err().unwrap();
+            assert_eq!(wrong.kind(), ErrorKind::RuntimeMissingSymbol);
+            assert!(wrong.detail().unwrap().starts_with("libc.so.6: missing NDI symbol"));
+            assert!(wrong.to_string().contains("/nonexistent/libndi-test.so: not found"));
+        }
     }
 
     #[test]
